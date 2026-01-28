@@ -1,6 +1,6 @@
 # name: digest-combined2
 # about: (1) Append tracking params to internal links in digest emails + (2) reuse SAME email_id for open tracking pixel + postback after send
-# version: 2.0
+# version: 2.1
 # authors: you
 
 after_initialize do
@@ -26,31 +26,24 @@ after_initialize do
     # =========================
     ENABLED = true
 
-    # Postback after digest is sent
     ENDPOINT_URL = "https://ai.templetrends.com/digest_report.php"
 
-    # ===== Open tracking switch =====
     OPEN_TRACKING_ENABLED = true
-    # Tracking pixel endpoint (must return an actual tiny image)
-    # Example: https://ai.templetrends.com/digest_open.php?email_id=...&user_id=...&user_email=...
     OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
 
-    # ===== DEBUG LOGGING =====
     DEBUG_LOG = true
 
-    # Link-append fields
-    APPEND_ISDIGEST_FIELD = "isdigest"   # "1"
-    APPEND_USER_ID_FIELD  = "u"         # user id
-    APPEND_EMAIL_B64_FIELD = "dayofweek" # base64url(email)
-    APPEND_EMAIL_ID_FIELD  = "email_id"  # 20-digit random numeric
+    APPEND_ISDIGEST_FIELD   = "isdigest"
+    APPEND_USER_ID_FIELD    = "u"
+    APPEND_EMAIL_B64_FIELD  = "dayofweek"
+    APPEND_EMAIL_ID_FIELD   = "email_id"
 
-    # POST field names
     EMAIL_ID_FIELD              = "email_id"
-    OPEN_TRACKING_USED_FIELD    = "open_tracking_used"  # "1" or "0"
+    OPEN_TRACKING_USED_FIELD    = "open_tracking_used"
 
-    TOPIC_IDS_FIELD             = "topic_ids"           # CSV in EMAIL ORDER
-    TOPIC_COUNT_FIELD           = "topic_ids_count"     # integer
-    FIRST_TOPIC_ID_FIELD        = "first_topic_id"      # first topic id in email order (string)
+    TOPIC_IDS_FIELD             = "topic_ids"
+    TOPIC_COUNT_FIELD           = "topic_ids_count"
+    FIRST_TOPIC_ID_FIELD        = "first_topic_id"
 
     SUBJECT_FIELD               = "subject"
     SUBJECT_PRESENT_FLD         = "subject_present"
@@ -59,22 +52,19 @@ after_initialize do
 
     USER_ID_FIELD               = "user_id"
     USERNAME_FIELD              = "username"
-    USER_CREATED_AT_FIELD       = "user_created_at_utc" # ISO8601
+    USER_CREATED_AT_FIELD       = "user_created_at_utc"
 
     SUBJECT_MAX_LEN  = 300
     FROM_MAX_LEN     = 200
     USERNAME_MAX_LEN = 200
 
-    # Timeouts
     OPEN_TIMEOUT_SECONDS  = 3
     READ_TIMEOUT_SECONDS  = 3
     WRITE_TIMEOUT_SECONDS = 3
 
-    # Sidekiq retry count
     JOB_RETRY_COUNT = 2
     # =========================
 
-    # -------- Logging --------
     def self.log(msg)
       Rails.logger.info("[#{PLUGIN_NAME}] #{msg}")
     rescue StandardError
@@ -113,7 +103,6 @@ after_initialize do
       false
     end
 
-    # -------- Small helpers --------
     def self.safe_str(v, max_len)
       s = v.to_s.strip
       s = s[0, max_len] if s.length > max_len
@@ -184,7 +173,6 @@ after_initialize do
       Base64.urlsafe_encode64(email, padding: false)
     end
 
-    # Generate a random 20-digit numeric string.
     def self.random_20_digit_id
       digits = +""
       20.times { digits << SecureRandom.random_number(10).to_s }
@@ -194,10 +182,9 @@ after_initialize do
       (t + "0" * 20)[0, 20]
     end
 
-    # -------- Core requirement: derive email_id from FIRST link that has user_id (u=...) --------
-    # Returns { email_id: "", user_id: "" } (strings)
+    # STRICT: we only accept the FIRST internal link that has BOTH u=... AND email_id=... (20 digits)
+    # Returns { email_id: "", user_id: "" }
     def self.extract_tracking_from_message(message)
-      # 1) Try headers (as fallback)
       hdr_email_id = header_val(message, "X-Digest-Report-Email-Id")
       hdr_user_id  = header_val(message, "X-Digest-Report-User-Id")
 
@@ -212,7 +199,6 @@ after_initialize do
 
       base = Discourse.base_url.to_s
 
-      # Helper to parse and return from a single href
       parse_href = lambda do |href|
         return nil if href.to_s.strip.empty?
         h = href.to_s.strip
@@ -228,17 +214,17 @@ after_initialize do
           return nil
         end
 
-        q = URI.decode_www_form(uri.query || "")
         params = {}
-        q.each { |k, v| params[k.to_s] = v.to_s }
+        URI.decode_www_form(uri.query || "").each { |k, v| params[k.to_s] = v.to_s }
 
-        # MUST be "first link with user_id in it"
         uid = params[APPEND_USER_ID_FIELD].to_s.strip
         return nil if uid.empty?
 
         eid = params[APPEND_EMAIL_ID_FIELD].to_s.strip
-        # return even if eid empty (caller can fallback)
-        return { email_id: eid, user_id: uid }
+        # STRICT: require 20 digits
+        return nil unless eid.match?(/\A\d{20}\z/)
+
+        { email_id: eid, user_id: uid }
       end
 
       if Nokogiri
@@ -252,7 +238,6 @@ after_initialize do
         end
       end
 
-      # Regex fallback: grab href="..."; scan in order
       begin
         body.scan(/href="([^"]+)"/i).each do |m|
           res = parse_href.call(m[0])
@@ -261,14 +246,14 @@ after_initialize do
       rescue StandardError
       end
 
-      # If we got here, keep header fallback
+      # If no STRICT match found, fall back to headers (could still be blank)
       { email_id: hdr_email_id, user_id: hdr_user_id }
     rescue StandardError
       { email_id: "", user_id: "" }
     end
 
-    # -------- Link rewriter: keep SAME logic + ALSO append email_id (generated once here) --------
-    # Returns the email_id used (string)
+    # Keep your append logic the same, but also add email_id=20digits
+    # Returns email_id used
     def self.rewrite_digest_links!(message, user)
       return "" if message.nil?
 
@@ -292,13 +277,13 @@ after_initialize do
         doc.css("a[href]").each do |a|
           href = a["href"].to_s.strip
           next if href.empty?
+
           next if href.start_with?("mailto:", "tel:", "sms:", "#")
 
           is_relative = href.start_with?("/")
           is_internal = !base.empty? && href.start_with?(base)
           next unless is_relative || is_internal
 
-          # optional safety: don't touch unsubscribe / prefs links
           next if href.include?("/email/unsubscribe") || href.include?("/my/preferences")
 
           begin
@@ -318,7 +303,6 @@ after_initialize do
             params << [APPEND_EMAIL_B64_FIELD, dayofweek_val] unless params.any? { |k, _| k == APPEND_EMAIL_B64_FIELD }
           end
 
-          # NEW: email_id generated here, appended to internal links
           params << [APPEND_EMAIL_ID_FIELD, email_id_val] unless params.any? { |k, _| k == APPEND_EMAIL_ID_FIELD }
 
           uri.query = URI.encode_www_form(params)
@@ -328,7 +312,6 @@ after_initialize do
         html_part.body = doc.to_html
 
       else
-        # Regex fallback (keeps your original behavior)
         html_part.body = body.gsub(/href="(#{Regexp.escape(base)}[^"]*|\/[^"]*)"/) do
           url = Regexp.last_match(1)
           next %{href="#{url}"} if url.include?("#{APPEND_ISDIGEST_FIELD}=") ||
@@ -344,7 +327,7 @@ after_initialize do
         end
       end
 
-      # Optional: also stamp headers early (scan requirement still satisfied because links contain it)
+      # Optional header stamp (does NOT change the "scan links first" rule)
       begin
         message.header["X-Digest-Report-Email-Id"] = email_id_val.to_s
         message.header["X-Digest-Report-User-Id"]  = user.id.to_s
@@ -357,7 +340,6 @@ after_initialize do
       ""
     end
 
-    # -------- Topic extraction for postback --------
     def self.extract_topic_ids_from_message(message)
       body = extract_email_body(message)
       return [] if body.to_s.empty?
@@ -405,7 +387,6 @@ after_initialize do
       []
     end
 
-    # -------- Open tracking pixel --------
     def self.build_tracking_pixel_html(email_id:, user_id:, user_email:)
       base = OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip
       return "" if base.empty?
@@ -493,9 +474,7 @@ after_initialize do
     end
   end
 
-  # =========================
-  # 1) Digest generation hook: append params to links (keeps same logic + adds email_id)
-  # =========================
+  # 1) Digest generation: append params to links (includes email_id)
   module ::DigestReportDigestPatch
     def digest(user, opts = {})
       super.tap do |message|
@@ -508,30 +487,31 @@ after_initialize do
     prepend ::DigestReportDigestPatch
   end
 
-  # =========================
-  # 2) BEFORE send: DO NOT generate email_id here.
-  #    First scan email html for first link with user_id (u=...), then reuse its email_id for pixel + headers.
-  # =========================
+  # 2) BEFORE send: STRICT scan for first internal link with BOTH u= and email_id=20digits. Do NOT generate here.
   DiscourseEvent.on(:before_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
 
-      # If already stamped, skip (prevents double runs)
       existing_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
       if !existing_id.empty?
         ::DigestReport.dlog("before_email_send: already stamped email_id=#{existing_id} -> skip")
         next
       end
 
-      # REQUIRED: scan first link with u=... and continue from that email_id
       tracking = ::DigestReport.extract_tracking_from_message(message)
       email_id = tracking[:email_id].to_s.strip
       uid_str  = tracking[:user_id].to_s.strip
 
       recipient = ::DigestReport.first_recipient_email(message)
 
-      # Fallbacks (should be rarely needed)
+      # If strict scan failed (email_id blank), we still won't break sending:
+      # we fall back to user lookup + random id (but logs it clearly).
+      if email_id.empty?
+        ::DigestReport.log_error("STRICT SCAN FAILED: no link with u= and email_id=20digits found. Falling back to random email_id.")
+        email_id = ::DigestReport.random_20_digit_id
+      end
+
       if uid_str.empty? && !recipient.empty?
         begin
           u = User.find_by_email(recipient)
@@ -541,12 +521,6 @@ after_initialize do
         end
       end
       uid = uid_str.to_i
-
-      if email_id.empty?
-        # Links SHOULD already contain it; but never break sending.
-        email_id = ::DigestReport.header_val(message, "X-Digest-Email-Id").to_s.strip
-      end
-      email_id = ::DigestReport.random_20_digit_id if email_id.empty?
 
       injected = false
       if ::DigestReport.open_tracking_enabled?
@@ -568,17 +542,13 @@ after_initialize do
       rescue StandardError
       end
 
-      ::DigestReport.dlog(
-        "before_email_send: derived_from_links email_id=#{email_id} uid=#{uid} to=#{recipient.inspect} injected=#{injected} open_used=#{open_used}"
-      )
+      ::DigestReport.dlog("before_email_send: strict_link_scan email_id=#{email_id} uid=#{uid} to=#{recipient.inspect} injected=#{injected} open_used=#{open_used}")
     rescue StandardError => e
       ::DigestReport.dlog_error("before_email_send error err=#{e.class}: #{e.message}")
     end
   end
 
-  # =========================
-  # 3) Postback job (reuses same email_id)
-  # =========================
+  # 3) Postback job
   class ::Jobs::DigestReportPostback < ::Jobs::Base
     sidekiq_options queue: "low", retry: ::DigestReport::JOB_RETRY_COUNT
 
@@ -683,9 +653,7 @@ after_initialize do
     end
   end
 
-  # =========================
-  # 4) After send: enqueue postback (reuse same email_id; if headers missing, rescan links)
-  # =========================
+  # 4) After send: enqueue postback; prefer header email_id; if missing, STRICT rescan (must have u= and email_id=20digits)
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
@@ -707,27 +675,26 @@ after_initialize do
           ""
         end
 
-      # Prefer headers set in before_email_send
       email_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
       open_tracking_used = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
       open_tracking_used = (open_tracking_used == "1" ? "1" : "0")
 
       user_id_hdr = ::DigestReport.header_val(message, "X-Digest-Report-User-Id")
 
-      # If anything missing, REQUIRED: rescan first link with u=...
-      if email_id.empty? || user_id_hdr.empty?
+      if email_id.empty? || !email_id.match?(/\A\d{20}\z/)
         tracking = ::DigestReport.extract_tracking_from_message(message)
         email_id = tracking[:email_id].to_s.strip if email_id.empty?
         user_id_hdr = tracking[:user_id].to_s.strip if user_id_hdr.empty?
       end
 
-      email_id = ::DigestReport.random_20_digit_id if email_id.to_s.strip.empty?
+      if email_id.empty? || !email_id.match?(/\A\d{20}\z/)
+        ::DigestReport.log_error("STRICT RESCAN FAILED after send: no email_id=20digits found; using random fallback")
+        email_id = ::DigestReport.random_20_digit_id
+      end
 
       user = nil
       begin
-        if !recipient.empty?
-          user = User.find_by_email(recipient)
-        end
+        user = User.find_by_email(recipient) unless recipient.empty?
       rescue StandardError
         user = nil
       end
